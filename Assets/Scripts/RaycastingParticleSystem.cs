@@ -1,5 +1,6 @@
 using Unity.Burst;
 using Unity.Collections;
+using Unity.Jobs;
 using UnityEngine;
 using UnityEngine.ParticleSystemJobs;
 
@@ -9,8 +10,11 @@ namespace Game
     public class RaycastingParticleSystem : MonoBehaviour
     {
         [SerializeField] private float _bounciness = 0.5f;
+        [SerializeField] private ParticleSystem _contactParticles;
         
         private ParticleSystem _particleSystem;
+        private NativeList<Hit> _hits;
+        private JobHandle _jobHandle;
 
         private void Awake()
         {
@@ -23,24 +27,50 @@ namespace Game
             var commands = new NativeArray<RaycastCommand>(particlesCount, Allocator.TempJob);
 
             var buildRaycastCommandsJob = new BuildRaycastCommandsJob { DeltaTime = Time.deltaTime, Commands = commands };
-            var jobHandle = buildRaycastCommandsJob.ScheduleBatch(_particleSystem, 512);
+            _jobHandle = buildRaycastCommandsJob.ScheduleBatch(_particleSystem, 512);
             
             var raycastHits = new NativeArray<RaycastHit>(particlesCount, Allocator.TempJob);
-            jobHandle = RaycastCommand.ScheduleBatch(commands, raycastHits, 512, jobHandle);
+            _jobHandle = RaycastCommand.ScheduleBatch(commands, raycastHits, 512, _jobHandle);
 
-            var applyHitsJob = new ApplyHitsJob { Bounciness = _bounciness, Hits = raycastHits };
-            jobHandle = applyHitsJob.ScheduleBatch(_particleSystem, 512, jobHandle);
+            _hits = new NativeList<Hit>(particlesCount, Allocator.TempJob);
+            var applyHitsJob = new ApplyHitsJob { Bounciness = _bounciness, Hits = raycastHits, Result = _hits.AsParallelWriter()};
+            _jobHandle = applyHitsJob.ScheduleBatch(_particleSystem, 512, _jobHandle);
 
-            commands.Dispose(jobHandle);
-            raycastHits.Dispose(jobHandle);
+            commands.Dispose(_jobHandle);
+            raycastHits.Dispose(_jobHandle);
         }
-        
+
+        private void LateUpdate()
+        {
+            if (_contactParticles != null)
+            {
+                _jobHandle.Complete();
+
+                var size = _contactParticles.main.startSize.Evaluate(0);
+                var emitParams = new ParticleSystem.EmitParams();
+                foreach (var hit in _hits)
+                {
+                    emitParams.position = hit.Position;
+                    emitParams.rotation3D = hit.Rotation;
+                    emitParams.startSize = hit.Size * size;
+                    _contactParticles.Emit(emitParams, 1);
+                }
+
+                _hits.Dispose();
+            }
+            else
+            {
+                _hits.Dispose(_jobHandle);
+            }
+        }
+
         [BurstCompile]
         private struct ApplyHitsJob : IJobParticleSystemParallelForBatch
         {
             [ReadOnly] public NativeArray<RaycastHit> Hits;
             [ReadOnly] public float Bounciness;
-            
+            public NativeList<Hit>.ParallelWriter Result;
+
             public void Execute(ParticleSystemJobData jobData, int startIndex, int count)
             {
                 var velocities = jobData.velocities;
@@ -53,6 +83,14 @@ namespace Game
                         var velocity = velocities[i];
                         velocity = Vector3.Reflect(velocity, hit.normal) * Bounciness;
                         velocities[i] = velocity;
+
+                        var resultHit = new Hit
+                        {
+                            Position = hit.point + hit.normal * 0.01f,
+                            Rotation = Quaternion.LookRotation(-hit.normal, hit.normal.y > 0.9f ? Vector3.forward : Vector3.up).eulerAngles,
+                            Size = Mathf.Clamp(velocity.sqrMagnitude / 25f, 0.5f, 1f),
+                        };
+                        Result.AddNoResize(resultHit);
                     }
                 }
             }
@@ -77,6 +115,13 @@ namespace Game
                     Commands[i] = new RaycastCommand(Physics.defaultPhysicsScene, position, direction, QueryParameters.Default, distance);
                 }
             }
+        }
+        
+        private struct Hit
+        {
+            public Vector3 Position;
+            public Vector3 Rotation;
+            public float Size;
         }
     }
 }
